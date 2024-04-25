@@ -39,7 +39,7 @@ from transformers.utils import is_torch_fx_proxy
 # from training.app.construct_datasets.bucket_jsonl_by_token_length import model_name
 from ..import_utils import is_peft_available, is_wandb_available
 from ..models import PreTrainedModelWrapper
-from .laser_config import LaserRMTConfig
+from .laserm_config import LaserRMTConfig
 from .utils import (
     DPODataCollatorWithPadding,
     disable_dropout_in_model,

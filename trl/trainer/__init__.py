@@ -90,7 +90,7 @@ if TYPE_CHECKING:
     from .model_config import ModelConfig
     from .orpo_config import ORPOConfig
     from .orpo_trainer import ORPOTrainer
-    from .laser_config import LaserRMTConfig
+    from .laserm_config import LaserRMTConfig
     from .laserm_trainer import LaserRMTrainer
     
     from .laser_evol_merge_trainer import EvolMergeTrainer
