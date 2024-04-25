@@ -27,6 +27,8 @@ class LaserRMTConfig(TrainingArguments):
     command line.
 
     Parameters:
+        model_name (`str`, defaults to `None`):
+            The model name of the model to use.
         max_length (`int`, defaults to `None`):
             The maximum length of the sequences in the batch. This argument is required if you want to use the default data collator.
         max_prompt_length (`int`, defaults to `None`):
@@ -57,6 +59,7 @@ class LaserRMTConfig(TrainingArguments):
     max_prompt_length: Optional[int] = None
     max_completion_length: Optional[int] = None
 
+    model_name: str = None
     beta: float = 0.1
     disable_dropout: bool = True
 

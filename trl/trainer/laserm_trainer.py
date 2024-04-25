@@ -898,15 +898,10 @@ class LaserRMTrainer(Trainer):
                 }
             )
             self.state.log_history.pop()
-        
-        # Base evaluation
-        initial_output = super().evaluation_loop(
-            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
-        )
 
-        modifier = ModelModifier(self.args.model_name_or_path, self.model, self.tokenizer)
+        modifier = ModelModifier(self.args.model_name, self.model, self.tokenizer, self.args)
         print("LASER-MT | Starting SNR scanning...")
-        selected_weight_types = modifier.interactive_select_weights()
+        selected_weight_types = ['mlp.gate_proj','mlp.down_proj', 'mlp.up_proj', 'self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj'] # modifier.get_layers()
 
         if selected_weight_types:
             print(f"LASER-MT | {repr(selected_weight_types)} selected for SNR scanning.")
@@ -915,6 +910,12 @@ class LaserRMTrainer(Trainer):
             print("LASER-MT | Finished SNR scanning and data saved.")
         else:
             print("LASER-MT | No weight types selected.")
+        del modifier
+        torch.cuda.empty_cache()
+        # Base evaluation
+        initial_output = super().evaluation_loop(
+            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
+        )
         return initial_output
 
     def log(self, logs: Dict[str, float]) -> None:
