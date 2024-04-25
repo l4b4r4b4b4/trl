@@ -904,7 +904,7 @@ class LaserRMTrainer(Trainer):
             dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
         )
 
-        modifier = ModelModifier(self.model.model_name)
+        modifier = ModelModifier(self.args.model_name_or_path, self.model, self.tokenizer)
         print("LASER-MT | Starting SNR scanning...")
         selected_weight_types = modifier.interactive_select_weights()
 
