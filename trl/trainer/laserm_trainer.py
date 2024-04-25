@@ -47,7 +47,7 @@ from .utils import (
     peft_module_casting_to_bf16,
     trl_sanitze_kwargs_for_tagging,
 )
-from laser_scanner import ModelModifier
+from .laser_scanner import ModelModifier
 
 if is_peft_available():
     from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
