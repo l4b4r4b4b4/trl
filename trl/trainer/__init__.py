@@ -39,6 +39,10 @@ _import_structure = {
     "model_config": ["ModelConfig"],
     "orpo_config": ["ORPOConfig"],
     "orpo_trainer": ["ORPOTrainer"],
+    "laserm_config": ["LaserRMTConfig"],
+    "laserm_trainer": ["LaserRMTrainer"],
+    "laser_evol_merge_trainer": ["EvolMergeConfig"],
+    "laser_evol_merge_trainer": ["EvolMergeTrainer"],
     "ppo_config": ["PPOConfig"],
     "ppo_trainer": ["PPOTrainer"],
     "reward_config": ["RewardConfig"],
@@ -86,6 +90,11 @@ if TYPE_CHECKING:
     from .model_config import ModelConfig
     from .orpo_config import ORPOConfig
     from .orpo_trainer import ORPOTrainer
+    from .laser_config import LaserRMTConfig
+    from .laserm_trainer import LaserRMTrainer
+    
+    from .laser_evol_merge_trainer import EvolMergeTrainer
+    from .laser_evol_merge_config import EvolMergeConfig
     from .ppo_config import PPOConfig
     from .ppo_trainer import PPOTrainer
     from .reward_config import RewardConfig
