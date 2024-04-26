@@ -26,11 +26,12 @@ logger.addHandler(f_handler)
 class ModelModifier:
     def __init__(self, model_name, model):
         self.model_name = model_name
-        self.model = model  # AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+        self.model = torch.compile(model)  # AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
         self.layer_snr = {}
         self.modified_layers = set()
         self.original_weights = {}
 
+    @torch.compile
     def calculate_snr_for_layer(self, layer_type, layer_number):
         for name, module in self.model.named_modules():
             if layer_type in name and str(layer_number) in name:
@@ -67,7 +68,7 @@ class ModelModifier:
         sigma_estimated = iqr / 1.349 ## 0.6745 * sigma is the expected range between the quantiles (Q1 and Q3)
         return sigma_estimated
 
-
+    @torch.compile
     def assess_layers_snr(self, layer_types, layer_numbers):
         for name, module in self.model.named_modules():
             for layer_number in layer_numbers:
