@@ -49,6 +49,27 @@ from .utils import (
 )
 from .laser_scanner import ModelModifier
 
+import logging
+# Create a custom logger
+logger = logging.getLogger("LaserRMTrainer | Training")
+
+# Set level of logging
+logger.setLevel(logging.DEBUG)  # Set to lowest level needed
+
+# Create handlers
+c_handler = logging.StreamHandler()  # This outputs to sys.stdout
+f_handler = logging.FileHandler("file.log")
+
+# Create formatters and add it to handlers
+c_format = logging.Formatter("%(name)s - %(levelname)s - %(message)s")
+f_format = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+c_handler.setFormatter(c_format)
+f_handler.setFormatter(f_format)
+
+# Add handlers to the logger
+logger.addHandler(c_handler)
+logger.addHandler(f_handler)
+
 if is_peft_available():
     from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
 
@@ -899,23 +920,31 @@ class LaserRMTrainer(Trainer):
             )
             self.state.log_history.pop()
 
-        modifier = ModelModifier(self.args.model_name, self.model, self.tokenizer, self.args)
-        print("LASER-MT | Starting SNR scanning...")
-        selected_weight_types = ['mlp.gate_proj','mlp.down_proj', 'mlp.up_proj', 'self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj'] # modifier.get_layers()
-
-        if selected_weight_types:
-            print(f"LASER-MT | {repr(selected_weight_types)} selected for SNR scanning.")
-            modifier.assess_layers_snr(selected_weight_types)
-            modifier.save_snr_to_json()
-            print("LASER-MT | Finished SNR scanning and data saved.")
-        else:
-            print("LASER-MT | No weight types selected.")
-        del modifier
-        torch.cuda.empty_cache()
+        
         # Base evaluation
         initial_output = super().evaluation_loop(
             dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
         )
+        modifier = ModelModifier(self.args.model_name, self.model.to(
+            dtype=torch.float32, device=self.args.device
+        ), self.tokenizer, self.args)
+        logger.info("Starting SNR scanning...")
+        selected_weight_types = ['mlp.gate_proj','mlp.down_proj', 'mlp.up_proj', 'self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj'] # modifier.get_layers()
+        if selected_weight_types:
+            logger.info(f"{repr(selected_weight_types)} selected for SNR scanning.")
+            modifier.assess_layers_snr(selected_weight_types)
+            modifier.save_snr_to_json()
+            logger.info("Finished SNR scanning and data saved.")
+        else:
+            logger.info("No weight types selected.")
+        if self.args.bf16:
+            dtype = torch.bfloat16
+        elif self.args.fp16:
+            dtype = torch.half
+        self.model.to(dtype=dtype, device=self.args.device)
+        # del modifier
+        # torch.cuda.empty_cache()
+        
         return initial_output
 
     def log(self, logs: Dict[str, float]) -> None:

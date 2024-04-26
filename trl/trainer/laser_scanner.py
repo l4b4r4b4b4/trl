@@ -1,15 +1,31 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 import json
+import logging
+# Create a custom logger
+logger = logging.getLogger("LaserRMTrainer | Scanning")
 
+# Set level of logging
+logger.setLevel(logging.DEBUG)  # Set to lowest level needed
+
+# Create handlers
+c_handler = logging.StreamHandler()  # This outputs to sys.stdout
+f_handler = logging.FileHandler("file.log")
+
+# Create formatters and add it to handlers
+c_format = logging.Formatter("%(name)s - %(levelname)s - %(message)s")
+f_format = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+c_handler.setFormatter(c_format)
+f_handler.setFormatter(f_format)
+
+# Add handlers to the logger
+logger.addHandler(c_handler)
+logger.addHandler(f_handler)
 
 class ModelModifier:
     def __init__(self, model_name, model, tokenizer, args):
         self.model_name = model_name
-        self.model = model.to(
-            dtype=torch.float32, device=args.device
-        )  # AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+        self.model = model  # AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
         self.optimizer = torch.optim.Adam(self.model.parameters())
         self.tokenizer = tokenizer  # AutoTokenizer.from_pretrained(model_name, use_fast=True, add_prefix_space=True)
         self.layer_snr = {}
@@ -47,7 +63,7 @@ class ModelModifier:
                 snr = signal / noise if noise != 0 else float("inf")
                 snr_ratio = snr / max_singular_value
                 self.layer_snr[name] = snr_ratio
-                print(f"Calculated SNR for {name}: {snr_ratio}")
+                logger.info(f"SNR layer {'.'.join(name.split('.')[4:])}: {snr_ratio}")
 
     @staticmethod
     def marchenko_pastur_threshold(sigma, n, m):
@@ -72,9 +88,11 @@ class ModelModifier:
         sorted_layer_snr = dict(sorted(self.layer_snr.items(), key=lambda x: x[1], reverse=True))
         with open(filename, "w") as file:
             json.dump({k: float(v) for k, v in sorted_layer_snr.items()}, file, indent=4)
-        print(f"Results saved to {filename}")
+        logger.info(f"Results saved to {filename}")
         # Generate YAML file for the top 50% SNR
         self.generate_unfrozen_params_yaml(sorted_layer_snr)
+        logger.info(f"Layers sorted by SNR: {sorted_layer_snr}")
+        return sorted_layer_snr
 
     def generate_unfrozen_params_yaml(self, sorted_snr):
         top_layers = list(sorted_snr.keys())[: len(sorted_snr) // 2]  # Top 50% layers
@@ -82,16 +100,3 @@ class ModelModifier:
             file.write("unfrozen_parameters:\n")
             for layer in top_layers:
                 file.write(f"- {layer}\n")
-
-
-# Usage
-# model_name = "stabilityai/stablelm-2-1_6b"
-# modifier = ModelModifier(model_name)
-# selected_weight_types = modifier.get_layers()
-
-# if selected_weight_types:
-#     modifier.assess_layers_snr(selected_weight_types)
-#     modifier.save_snr_to_json()
-#     print("Finished SNR scanning and data saved.")
-# else:
-#     print("No weight types selected.")
