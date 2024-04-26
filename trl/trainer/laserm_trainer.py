@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import subprocess
 import inspect
 import random
 import warnings
@@ -50,6 +50,7 @@ from .utils import (
 from .laser_scanner import ModelModifier
 
 import logging
+import yaml
 # Create a custom logger
 logger = logging.getLogger("LaserRMTrainer | Training")
 
@@ -79,6 +80,30 @@ if is_wandb_available():
 
 if is_deepspeed_available():
     import deepspeed
+
+def create_prune_one_yaml(k, N, output_file_path="output.yaml"):
+    data = {
+        "slices": [
+            {
+                "sources": [
+                    {"model": "TroyDoesAI/Mermaid-Llama-3-8B", "layer_range": [0, k]}
+                ]
+            },
+            {
+                "sources": [
+                    {
+                        "model": "TroyDoesAI/Mermaid-Llama-3-8B",
+                        "layer_range": [k + 1, N],
+                    }
+                ]
+            },
+        ],
+        "merge_method": "passthrough",
+        "dtype": "float16",
+    }
+
+    with open(output_file_path, "w") as outfile:
+        yaml.dump(data, outfile, default_flow_style=False)
 
 
 class LaserRMTrainer(Trainer):
@@ -920,21 +945,49 @@ class LaserRMTrainer(Trainer):
             )
             self.state.log_history.pop()
 
-        
         # Base evaluation
         initial_output = super().evaluation_loop(
             dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
         )
-        modifier = ModelModifier(self.args.model_name, self.model.to(
-            dtype=torch.float32, device=self.args.device
-        ), self.tokenizer, self.args)
+        model_name = self.args.model_name
+        n_layers = self.model.config.num_hidden_layers
+        modifier = ModelModifier(model_name, self.model.to(dtype=torch.float32, device=self.args.device))
         logger.info("Starting SNR scanning...")
-        selected_weight_types = ['mlp.gate_proj','mlp.down_proj', 'mlp.up_proj', 'self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj'] # modifier.get_layers()
-        if selected_weight_types:
-            logger.info(f"{repr(selected_weight_types)} selected for SNR scanning.")
-            modifier.assess_layers_snr(selected_weight_types)
-            modifier.save_snr_to_json()
+        layer_numbers = list(range(n_layers, -1, -1))
+        layer_numbers_str = [f".{l}." for l in layer_numbers]
+        logger.info(f"Model architecture: {repr(self.model)}")
+        logger.info(f"Number of layers := {layer_numbers_str}")
+
+        layer_types = [
+            "mlp.gate",
+            "mlp.down_proj",
+            "mlp.up_proj",
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+        ]
+
+        logger.info("Finished LaserRMT scanning.")
+        if layer_types:
+            logger.info(f"{repr(layer_types)} selected for SNR scanning.")
+            modifier.assess_layers_snr(layer_types, layer_numbers)
+            bottom_snr_ratios = modifier.get_bottom_snr_ratios() # Define your specific top_n here otherwise it will be top_n=16
+            top_snr_ratios = modifier.get_top_snr_ratios() # Define your specific top_n here otherwise it will be top_n=16
+
+            logger.info(f"Finished laserRMT scanning. Top snr ratios: {repr(top_snr_ratios)}")
+            logger.info(f"Finished laserRMT scanning. Bottom snr ratios: {repr(bottom_snr_ratios)}")
+
+            # Save the layer information to a JSON file
+            modifier.save_top_snr_ratios_to_json(f"laser_scan_{model_name}_top_snr.json")
+            modifier.save_bottom_snr_ratios_to_json(f"laser_scan_{model_name}_bottom_snr.json")
+            modifier.save_layers_to_json(f"laser_scan_{model_name}.json")
+
             logger.info("Finished SNR scanning and data saved.")
+            merge_config_file_path = f"data/prune_one_{model_name}.yaml"
+            create_prune_one_yaml(bottom_snr_ratios[0], n_layers, merge_config_file_path)
+            command = str(f"mergekit-moe {merge_config_file_path} models/llm/{model_name}_prune")
+            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
         else:
             logger.info("No weight types selected.")
         if self.args.bf16:
@@ -944,7 +997,7 @@ class LaserRMTrainer(Trainer):
         self.model.to(dtype=dtype, device=self.args.device)
         # del modifier
         # torch.cuda.empty_cache()
-        
+
         return initial_output
 
     def log(self, logs: Dict[str, float]) -> None:

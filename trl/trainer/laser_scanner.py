@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import json
+import gc
 import logging
 # Create a custom logger
 logger = logging.getLogger("LaserRMTrainer | Scanning")
@@ -23,80 +24,143 @@ logger.addHandler(c_handler)
 logger.addHandler(f_handler)
 
 class ModelModifier:
-    def __init__(self, model_name, model, tokenizer, args):
+    def __init__(self, model_name, model):
         self.model_name = model_name
         self.model = model  # AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
-        self.optimizer = torch.optim.Adam(self.model.parameters())
-        self.tokenizer = tokenizer  # AutoTokenizer.from_pretrained(model_name, use_fast=True, add_prefix_space=True)
         self.layer_snr = {}
+        self.modified_layers = set()
+        self.original_weights = {}
 
-    def get_weight_types(self):
-        weight_types = set()
+    def calculate_snr_for_layer(self, layer_type, layer_number):
         for name, module in self.model.named_modules():
-            parts = name.split(".")
-            if hasattr(module, "weight") and len(parts) > 2:
-                weight_types.add(parts[-1])
-        return list(weight_types)
-
-    def get_layers(self):
-        selected_types = self.get_weight_types()
-        return selected_types
-
-    def calculate_snr_for_layer(self, layer_type):
-        batch_size = 3  # Adjust batch size to your configuration
-        layers = [
-            (name, module)
-            for name, module in self.model.named_modules()
-            if layer_type in name and hasattr(module, "weight")
-        ]
-        for i in range(0, len(layers), batch_size):
-            batch_layers = layers[i : i + batch_size]
-            for name, module in batch_layers:
-                weights = module.weight.detach()
+            if layer_type in name and str(layer_number) in name:
+                weights = module.weight.double()
                 S = torch.linalg.svdvals(weights)
-                max_singular_value = S[0].item()
+                max_singular_value = S[0].item()  # First singularity value
+                weights = weights.detach().cpu()
+                S = S.detach().cpu()
                 sigma_estimated = self.estimate_sigma_with_full_iqr(S)
                 n, m = weights.shape
                 mp_threshold = self.marchenko_pastur_threshold(sigma_estimated, n, m)
-                signal = S[S > mp_threshold].sum().item()
-                noise = S[S <= mp_threshold].sum().item()
-                snr = signal / noise if noise != 0 else float("inf")
-                snr_ratio = snr / max_singular_value
-                self.layer_snr[name] = snr_ratio
-                logger.info(f"SNR layer {'.'.join(name.split('.')[4:])}: {snr_ratio}")
 
+                signal = S[S > mp_threshold].sum()
+                noise = S[S <= mp_threshold].sum()
+                snr = signal / noise if noise != 0 else float('inf')
+                snr_ratio = snr / max_singular_value  # Calculates the ratio of SNR to the highest singularity value
+                del S, weights
+                torch.cuda.empty_cache()  # Clear PyTorch's CUDA memory cache
+                gc.collect()
+                return snr_ratio  # Returns the ratio
     @staticmethod
     def marchenko_pastur_threshold(sigma, n, m):
         beta = n / m if n < m else m / n
-        threshold = sigma * np.sqrt((1 + np.sqrt(beta)) ** 2)
+        threshold = sigma * np.sqrt((1 + np.sqrt(beta))**2)
         return threshold
+
+    ## Calculate an estimate of the standard deviation of the singular values based on Inter Quantile Range
 
     @staticmethod
     def estimate_sigma_with_full_iqr(S):
         q75 = torch.quantile(S, 0.75)
         q25 = torch.quantile(S, 0.25)
         iqr = q75 - q25
-        sigma_estimated = iqr / 1.349
+        sigma_estimated = iqr / 1.349 ## 0.6745 * sigma is the expected range between the quantiles (Q1 and Q3)
         return sigma_estimated
 
-    def assess_layers_snr(self, selected_weight_types):
-        for layer_type in selected_weight_types:
-            self.calculate_snr_for_layer(layer_type)
 
-    def save_snr_to_json(self):
-        filename = f"snr_results_{self.model_name.split('/')[-1]}.json"
-        sorted_layer_snr = dict(sorted(self.layer_snr.items(), key=lambda x: x[1], reverse=True))
-        with open(filename, "w") as file:
-            json.dump({k: float(v) for k, v in sorted_layer_snr.items()}, file, indent=4)
-        logger.info(f"Results saved to {filename}")
-        # Generate YAML file for the top 50% SNR
-        self.generate_unfrozen_params_yaml(sorted_layer_snr)
-        logger.info(f"Layers sorted by SNR: {sorted_layer_snr}")
-        return sorted_layer_snr
+    def assess_layers_snr(self, layer_types, layer_numbers):
+        for name, module in self.model.named_modules():
+            for layer_number in layer_numbers:
+                for layer_type in layer_types:
+                    if layer_type in name and str(layer_number) in name:
+                        print("*"*50, flush=True)
+                        print(f"Calculating Signal to Noise Ratio at layer {name}", flush=True)
+                        snr_ratio = self.calculate_snr_for_layer(layer_type, layer_number)
+                        self.layer_snr[name] = {'snr_ratio': snr_ratio, 'module': name}
+                        print(f"Signal to Noise Ratio at layer {name} = {snr_ratio}", flush=True)
+                        print("*"*50, flush=True)
 
-    def generate_unfrozen_params_yaml(self, sorted_snr):
-        top_layers = list(sorted_snr.keys())[: len(sorted_snr) // 2]  # Top 50% layers
-        with open(f"unfrozen_parameters_{self.model_name.split('/')[-1]}.yaml", "w") as file:
-            file.write("unfrozen_parameters:\n")
-            for layer in top_layers:
-                file.write(f"- {layer}\n")
+
+    def save_layers_to_json(self, filename="layer_snr_info.json"):
+        with open(filename, 'w') as file:
+            serializable_data = {}
+            for key, value in self.layer_snr.items():
+                # Convert Tensors to Python numbers (for SNR) and handle other data types as needed
+                snr_value = value['snr_ratio'].item() if isinstance(value['snr_ratio'], torch.Tensor) else value['snr_ratio']
+                module_str = str(value['module'])  # Assuming module representation is a string or convertible to a string
+                serializable_data[key] = {'snr': snr_value, 'module': module_str}
+
+            json.dump(serializable_data, file, indent=4)
+
+    def get_bottom_snr_ratios(self, bottom_n=16):
+        # Initialize a dictionary to store the SNR ratios for the specific modules
+        snr_ratios_per_specific_module = {
+            'self_attn.v_proj': [],
+            'self_attn.k_proj': [],
+            'self_attn.o_proj': [],
+            'self_attn.q_proj': [],
+            'mlp.down_proj': [],
+            'mlp.up_proj': [],
+            'mlp.gate_proj': []
+        }
+
+        # Run through all layer SNR entries
+        for name, value in self.layer_snr.items():
+            snr_ratio = value['snr_ratio']
+            layer_name = value['module']
+
+            # For each specific module, check if the layer name contains the module
+            for specific_module in snr_ratios_per_specific_module.keys():
+                if specific_module in layer_name:
+                    # Add the layer name and SNR value to the corresponding entry
+                    snr_ratios_per_specific_module[specific_module].append((layer_name, snr_ratio))
+                    break  # End the loop when the module is found to avoid duplicate entries
+
+        # Sort and extract the bottom 16 SNR values for each specific module
+        bottom_snr_layers = {}
+        for module, snr_ratios in snr_ratios_per_specific_module.items():
+            sorted_layers = sorted(snr_ratios, key=lambda x: x[1])  # Sort by SNR value
+            bottom_snr_layers[module] = [layer[0] for layer in sorted_layers[:bottom_n]]  # Saving the layer names
+
+        return bottom_snr_layers
+
+    def get_top_snr_ratios(self, top_n=16):
+        # Initialize a dictionary to store the SNR ratios for the specific modules
+        snr_ratios_per_specific_module = {
+            'self_attn.v_proj': [],
+            'self_attn.k_proj': [],
+            'self_attn.o_proj': [],
+            'self_attn.q_proj': [],
+            'mlp.down_proj': [],
+            'mlp.up_proj': [],
+            'mlp.gate_proj': []
+        }
+
+        # Run through all layer SNR entries
+        for name, value in self.layer_snr.items():
+            snr_ratio = value['snr_ratio']
+            layer_name = value['module']
+
+            # For each specific module, check if the layer name contains the module
+            for specific_module in snr_ratios_per_specific_module.keys():
+                if specific_module in layer_name:
+                    # Add the layer name and SNR value to the corresponding entry
+                    snr_ratios_per_specific_module[specific_module].append((layer_name, snr_ratio))
+                    break  # End the loop when the module is found to avoid duplicate entries
+
+        # Sort and extract the top 16 SNR values for each specific module
+        top_snr_layers = {}
+        for module, snr_ratios in snr_ratios_per_specific_module.items():
+            sorted_layers = sorted(snr_ratios, key=lambda x: x[1], reverse=True)  # Sort by SNR value
+            top_snr_layers[module] = [layer[0] for layer in sorted_layers[:top_n]]  # Saving the layer names
+
+        return top_snr_layers
+
+
+    def save_top_snr_ratios_to_json(self, top_snr_layers, filename="top_snr_ratios.json"):
+        with open(filename, 'w') as file:
+            json.dump(top_snr_layers, file, indent=4)
+
+    def save_bottom_snr_ratios_to_json(self, bottom_snr_layers, filename="bottom_snr_ratios.json"):
+        with open(filename, 'w') as file:
+            json.dump(bottom_snr_layers, file, indent=4)
