@@ -58,6 +58,7 @@ from .laser_scanner import ModelModifier
 
 import logging
 import yaml
+from torch.utils.tensorboard import SummaryWriter
 
 # Create a custom logger
 logger = logging.getLogger("LaserRMTrainer | Training")
@@ -172,7 +173,7 @@ class LaserRMTrainer(Trainer):
                 if model_init_kwargs["torch_dtype"] in ["auto", None]
                 else getattr(torch, model_init_kwargs["torch_dtype"])
             )
-
+        self.writer = SummaryWriter()
         if isinstance(model, str):
             warnings.warn(
                 "You passed a model_id to the LaserRMTrainer. This will automatically create an "
