@@ -42,7 +42,8 @@ from transformers import AutoModelForCausalLM, DataCollator, PreTrainedModel, Pr
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_torch_fx_proxy
-
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 # from training.app.construct_datasets.bucket_jsonl_by_token_length import model_name
 from ..import_utils import is_peft_available, is_wandb_available
 from ..models import PreTrainedModelWrapper
@@ -173,7 +174,7 @@ class LaserRMTrainer(Trainer):
                 if model_init_kwargs["torch_dtype"] in ["auto", None]
                 else getattr(torch, model_init_kwargs["torch_dtype"])
             )
-        self.writer = SummaryWriter()
+        # self.writer = SummaryWriter()
         if isinstance(model, str):
             warnings.warn(
                 "You passed a model_id to the LaserRMTrainer. This will automatically create an "
@@ -983,16 +984,16 @@ class LaserRMTrainer(Trainer):
             dtype_string = "float16"
         if layer_types:
             logger.info(f"{repr(layer_types)} selected for SNR scanning.")
-            modifier.assess_layers_snr(layer_types, layer_numbers)
-            bottom_snr_ratios = (
-                modifier.get_bottom_snr_ratios()
-            )  # Define your specific top_n here otherwise it will be top_n=16
-            top_snr_ratios = (
-                modifier.get_top_snr_ratios()
-            )  # Define your specific top_n here otherwise it will be top_n=16
+            # modifier.assess_layers_snr(layer_types, layer_numbers)
+            # bottom_snr_ratios = (
+            #     modifier.get_bottom_snr_ratios()
+            # )  # Define your specific top_n here otherwise it will be top_n=16
+            # top_snr_ratios = (
+            #     modifier.get_top_snr_ratios()
+            # )  # Define your specific top_n here otherwise it will be top_n=16
 
-            logger.info(f"Finished laserRMT scanning. Top snr ratios: {repr(top_snr_ratios)}")
-            logger.info(f"Finished laserRMT scanning. Bottom snr ratios: {repr(bottom_snr_ratios)}")
+            # logger.info(f"Finished laserRMT scanning. Top snr ratios: {repr(top_snr_ratios)}")
+            # logger.info(f"Finished laserRMT scanning. Bottom snr ratios: {repr(bottom_snr_ratios)}")
 
             # Save the layer information to a JSON file
             # modifier.save_top_snr_ratios_to_json(f"data/llm/{model_name}/laser_scan_{model_name}_top_snr.json")
