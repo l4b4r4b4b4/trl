@@ -1,5 +1,5 @@
-# ORPO Authors: Jiwoo Hong, Noah Lee, and James Thorne
-# Official code: https://github.com/xfactlab/orpo
+# FastGrokkingLaser Authors: Jiwoo Hong, Noah Lee, and James Thorne
+# Official code: https://github.com/xfactlab/FastGrokkingLaser
 # Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from functools import wraps
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
-
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -47,7 +47,7 @@ torch._dynamo.config.suppress_errors = True
 # from training.app.construct_datasets.bucket_jsonl_by_token_length import model_name
 from ..import_utils import is_peft_available, is_wandb_available
 from ..models import PreTrainedModelWrapper
-from .laserm_config import LaserRMTConfig
+from .laserm_config import FastGrokkingLaserConfig
 from .utils import (
     DPODataCollatorWithPadding,
     disable_dropout_in_model,
@@ -62,7 +62,7 @@ import yaml
 from torch.utils.tensorboard import SummaryWriter
 
 # Create a custom logger
-logger = logging.getLogger("LaserRMTrainer | Training")
+logger = logging.getLogger("FastGrokkingLaserTrainer | Training")
 
 # Set level of logging
 logger.setLevel(logging.DEBUG)  # Set to lowest level needed
@@ -113,15 +113,15 @@ def create_prune_one_yaml(k, N, dtype="bfloat16", output_file_path="output.yaml"
         yaml.dump(data, outfile, default_flow_style=False)
 
 
-class LaserRMTrainer(Trainer):
+class FastGrokkingLaserTrainer(Trainer):
     r"""
-    Initialize LaserRMTrainer.
+    Initialize FastGrokkingLaserTrainer.
 
     Args:
         model (`transformers.PreTrainedModel`):
             The model to train, preferably an `AutoModelForSequenceClassification`.
-        args (`LaserRMTConfig`):
-            The ORPO config arguments to use for training.
+        args (`FastGrokkingLaserConfig`):
+            The FastGrokkingLaser config arguments to use for training.
         data_collator (`transformers.DataCollator`):
             The data collator to use for training. If None is specified, the default data collator (`DPODataCollatorWithPadding`) will be used
             which will pad the sequences to the maximum length of the sequences in the batch, given a dataset of paired sequences.
@@ -146,12 +146,12 @@ class LaserRMTrainer(Trainer):
             a dictionary string to metric values.
     """
 
-    _tag_names = ["trl", "orpo"]
+    _tag_names = ["trl", "FastGrokkingLaser"]
 
     def __init__(
         self,
         model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
-        args: Optional[LaserRMTConfig] = None,
+        args: Optional[FastGrokkingLaserConfig] = None,
         data_collator: Optional[DataCollator] = None,
         train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
@@ -166,7 +166,7 @@ class LaserRMTrainer(Trainer):
         if args.model_init_kwargs is None:
             model_init_kwargs = {}
         elif not isinstance(model, str):
-            raise ValueError("You passed model_kwargs to the LaserRMTrainer. But your model is already instantiated.")
+            raise ValueError("You passed model_kwargs to the FastGrokkingLaserTrainer. But your model is already instantiated.")
         else:
             model_init_kwargs = args.model_init_kwargs
             model_init_kwargs["torch_dtype"] = (
@@ -177,7 +177,7 @@ class LaserRMTrainer(Trainer):
         # self.writer = SummaryWriter()
         if isinstance(model, str):
             warnings.warn(
-                "You passed a model_id to the LaserRMTrainer. This will automatically create an "
+                "You passed a model_id to the FastGrokkingLaserTrainer. This will automatically create an "
                 "`AutoModelForCausalLM` or a `PeftModel` (if you passed a `peft_config`) for you."
             )
             model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
@@ -258,10 +258,10 @@ class LaserRMTrainer(Trainer):
             self.pad_token_id = model.config.pad_token_id
 
         if tokenizer is None:
-            raise ValueError("tokenizer must be specified to tokenize a ORPO dataset.")
+            raise ValueError("tokenizer must be specified to tokenize a FastGrokkingLaser dataset.")
         if args.max_length is None:
             warnings.warn(
-                "`max_length` is not set in the LaserRMTConfig's init"
+                "`max_length` is not set in the FastGrokkingLaserConfig's init"
                 " it will default to `512` by default, but you should do it yourself in the future.",
                 UserWarning,
             )
@@ -270,7 +270,7 @@ class LaserRMTrainer(Trainer):
             max_length = args.max_length
         if args.max_prompt_length is None:
             warnings.warn(
-                "`max_prompt_length` is not set in the LaserRMTConfig's init"
+                "`max_prompt_length` is not set in the FastGrokkingLaserConfig's init"
                 " it will default to `128` by default, but you should do it yourself in the future.",
                 UserWarning,
             )
@@ -280,7 +280,7 @@ class LaserRMTrainer(Trainer):
 
         if args.max_completion_length is None and self.is_encoder_decoder:
             warnings.warn(
-                "When using an encoder decoder architecture, you should set `max_completion_length` in the LaserRMTConfig's init"
+                "When using an encoder decoder architecture, you should set `max_completion_length` in the FastGrokkingLaserConfig's init"
                 " it will default to `128` by default, but you should do it yourself in the future.",
                 UserWarning,
             )
@@ -353,6 +353,52 @@ class LaserRMTrainer(Trainer):
             raise AttributeError(
                 "Your `Trainer` does not have an `accelerator` object. Consider upgrading `transformers`."
             )
+
+    @staticmethod
+    def gradfilter_ma(
+        m: nn.Module,
+        grads: Optional[Dict[str, deque]] = None,
+        window_size: int = 100,
+        lamb: float = 5.0,
+        filter_type: Literal['mean', 'sum'] = 'mean',
+        warmup: bool = True,
+        trigger: bool = False, # For ablation study.
+    ) -> Dict[str, deque]:
+        if grads is None:
+            grads = {n: deque(maxlen=window_size) for n, p in m.named_parameters() if p.requires_grad}
+
+        for n, p in m.named_parameters():
+            if p.requires_grad:
+                grads[n].append(p.grad.data.detach()) # .cpu())
+
+                # Modify the gradients.
+                if not warmup or len(grads[n]) == window_size and not trigger:
+                    if filter_type == "mean":
+                        avg = sum(grads[n]) / len(grads[n])
+                    elif filter_type == "sum":
+                        avg = sum(grads[n])
+                    else:
+                        raise ValueError(f"Unrecognized filter_type {filter_type}")
+                    p.grad.data = p.grad.data + avg * lamb
+
+        return grads
+
+    @staticmethod
+    def gradfilter_ema(
+        m: nn.Module,
+        grads: Optional[Dict[str, torch.Tensor]] = None,
+        alpha: float = 0.98,
+        lamb: float = 2.0,
+    ) -> Dict[str, torch.Tensor]:
+        if grads is None:
+            grads = {n: p.grad.data.detach() for n, p in m.named_parameters() if p.requires_grad}
+
+        for n, p in m.named_parameters():
+            if p.requires_grad:
+                grads[n] = grads[n] * alpha + p.grad.data.detach() * (1 - alpha)
+                p.grad.data = p.grad.data + grads[n] * lamb
+
+        return grads
 
     def _prepare_deepspeed(self, model: PreTrainedModelWrapper):
         # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
@@ -436,7 +482,7 @@ class LaserRMTrainer(Trainer):
         )
 
     def tokenize_row(self, feature, model: Optional[Union[PreTrainedModel, nn.Module]] = None) -> Dict:
-        """Tokenize a single row from a ORPO specific dataset.
+        """Tokenize a single row from a FastGrokkingLaser specific dataset.
 
         At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation
         in case the prompt + chosen or prompt + rejected responses is/are too long. First
@@ -648,7 +694,7 @@ class LaserRMTrainer(Trainer):
         policy_chosen_logps: torch.FloatTensor,
         policy_rejected_logps: torch.FloatTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-        """Compute ORPO's odds ratio (OR) loss for a batch of policy and reference model log probabilities.
+        """Compute FastGrokkingLaser's odds ratio (OR) loss for a batch of policy and reference model log probabilities.
 
         Args:
             policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
@@ -656,7 +702,7 @@ class LaserRMTrainer(Trainer):
 
         Returns:
             A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-            The losses tensor contains the ORPO loss for each example in the batch.
+            The losses tensor contains the FastGrokkingLaser loss for each example in the batch.
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
             The log odds ratio of the chosen responses over the rejected responses ratio for logging purposes.
             The `log(sigmoid(log_odds_chosen))` for logging purposes.
@@ -788,7 +834,7 @@ class LaserRMTrainer(Trainer):
         batch: Dict[str, Union[List, torch.LongTensor]],
         train_eval: Literal["train", "eval"] = "train",
     ):
-        """Compute the ORPO loss and other metrics for the given batch of inputs for train or test."""
+        """Compute the FastGrokkingLaser loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
 
         (
@@ -802,7 +848,7 @@ class LaserRMTrainer(Trainer):
         losses, chosen_rewards, rejected_rewards, log_odds_ratio, log_odds_chosen = self.odds_ratio_loss(
             policy_chosen_logps, policy_rejected_logps
         )
-        # full ORPO loss
+        # full FastGrokkingLaser loss
         loss = policy_nll_loss - losses.mean()
 
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
@@ -975,7 +1021,7 @@ class LaserRMTrainer(Trainer):
             "self_attn.o_proj",
         ]
 
-        logger.info("Finished LaserRMT scanning.")
+        logger.info("Finished FastGrokkingLaser scanning.")
         if self.args.bf16:
             dtype = torch.bfloat16
             dtype_string = "bfloat16"
@@ -992,8 +1038,8 @@ class LaserRMTrainer(Trainer):
             #     modifier.get_top_snr_ratios()
             # )  # Define your specific top_n here otherwise it will be top_n=16
 
-            # logger.info(f"Finished laserRMT scanning. Top snr ratios: {repr(top_snr_ratios)}")
-            # logger.info(f"Finished laserRMT scanning. Bottom snr ratios: {repr(bottom_snr_ratios)}")
+            # logger.info(f"Finished FastGrokkingLaser scanning. Top snr ratios: {repr(top_snr_ratios)}")
+            # logger.info(f"Finished FastGrokkingLaser scanning. Bottom snr ratios: {repr(bottom_snr_ratios)}")
 
             # Save the layer information to a JSON file
             # modifier.save_top_snr_ratios_to_json(f"data/llm/{model_name}/laser_scan_{model_name}_top_snr.json")
@@ -1048,7 +1094,7 @@ class LaserRMTrainer(Trainer):
     @wraps(Trainer.push_to_hub)
     def push_to_hub(self, commit_message: Optional[str] = "End of training", blocking: bool = True, **kwargs) -> str:
         """
-        Overwrite the `push_to_hub` method in order to force-add the tag "orpo" when pushing the
+        Overwrite the `push_to_hub` method in order to force-add the tag "FastGrokkingLaser" when pushing the
         model on the Hub. Please refer to `~transformers.Trainer.push_to_hub` for more details.
         """
         kwargs = trl_sanitze_kwargs_for_tagging(model=self.model, tag_names=self._tag_names, kwargs=kwargs)
