@@ -42,11 +42,12 @@ from transformers.trainer_utils import EvalLoopOutput
 
 from ..import_utils import is_peft_available, is_wandb_available
 from ..models import PreTrainedModelWrapper, create_reference_model
-from .dpo_config import DPOConfig
+from .dpo_config import DPOConfig, FDivergenceConstants, FDivergenceType
 from .utils import (
     DPODataCollatorWithPadding,
     RunningMoments,
     SyncRefModelCallback,
+    cap_exp,
     disable_dropout_in_model,
     pad_to_length,
     peft_module_casting_to_bf16,
@@ -135,7 +136,7 @@ class DPOTrainer(Trainer):
         ref_model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
         beta: float = 0.1,
         label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto_pair", "bco_pair", "robust"] = "sigmoid",
+        loss_type: Literal["sigmoid", "hinge", "ipo", "bco_pair", "robust", "aot", "aot_pair"] = "sigmoid",
         args: Optional[DPOConfig] = None,
         data_collator: Optional[DataCollator] = None,
         label_pad_token_id: int = -100,
@@ -463,10 +464,12 @@ class DPOTrainer(Trainer):
                 "You passed `label_smoothing` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
             )
             args.label_smoothing = label_smoothing
-        if args.loss_type in ["hinge", "ipo", "kto_pair", "bco_pair"] and args.label_smoothing > 0:
+        if args.loss_type in ["hinge", "ipo", "bco_pair"] and args.label_smoothing > 0:
             warnings.warn(
                 "You are using a loss type that does not support label smoothing. Ignoring label_smoothing parameter."
             )
+        if args.loss_type == "kto_pair":
+            raise ValueError("Support for kto_pair has been removed in DPOTrainer. Please use KTOTrainer.")
 
         if beta != 0.1:
             warnings.warn(
@@ -478,6 +481,9 @@ class DPOTrainer(Trainer):
         self.loss_type = args.loss_type
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
+
+        self.f_divergence_type = args.f_divergence_type
+        self.f_divergence_params = {FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY: args.f_alpha_divergence_coef}
 
         if dataset_num_proc is not None:
             warnings.warn(
@@ -996,15 +1002,43 @@ class DPOTrainer(Trainer):
             The losses tensor contains the DPO loss for each example in the batch.
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
-        pi_logratios = policy_chosen_logps - policy_rejected_logps
-        if self.reference_free:
-            ref_logratios = torch.tensor([0], dtype=pi_logratios.dtype, device=pi_logratios.device)
-        else:
-            ref_logratios = reference_chosen_logps - reference_rejected_logps
+        chosen_logratios = policy_chosen_logps.to(self.accelerator.device) - (
+            not self.reference_free
+        ) * reference_chosen_logps.to(self.accelerator.device)
+        rejected_logratios = policy_rejected_logps.to(self.accelerator.device) - (
+            not self.reference_free
+        ) * reference_rejected_logps.to(self.accelerator.device)
 
-        pi_logratios = pi_logratios.to(self.accelerator.device)
-        ref_logratios = ref_logratios.to(self.accelerator.device)
-        logits = pi_logratios - ref_logratios
+        if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE.value:
+            # The alpha-divergence formula: (1 - u^-alpha) / alpha
+            # The divergence difference between the chosen and rejected sample is:
+            #     (1 - u[w]^-alpha) / alpha - (1 - u[l]^-alpha) / alpha
+            #        = (u[l]^-alpha - u[w]^-alpha) / alpha
+            # where u[w] and u[l] are the policy/reference probability ratios
+            # for the chosen and rejected samples, respectively.
+            alpha_coef = FDivergenceConstants.ALPHA_DIVERGENCE_COEF_DEFAULT
+            if self.f_divergence_params and FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY in self.f_divergence_params:
+                alpha_coef = float(self.f_divergence_params[FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY])
+            logits = (cap_exp(rejected_logratios * -alpha_coef) - cap_exp(chosen_logratios * -alpha_coef)) / alpha_coef
+        else:
+            pi_logratios = policy_chosen_logps - policy_rejected_logps
+            if self.reference_free:
+                ref_logratios = torch.tensor([0], dtype=pi_logratios.dtype, device=pi_logratios.device)
+            else:
+                ref_logratios = reference_chosen_logps - reference_rejected_logps
+
+            pi_logratios = pi_logratios.to(self.accelerator.device)
+            ref_logratios = ref_logratios.to(self.accelerator.device)
+            logits = pi_logratios - ref_logratios
+
+            if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE.value:
+                # The js-divergence formula: log(2 * u / (1 + u))
+                # The divergence difference between the chosen and rejected sample is:
+                #     log(2 * u[w] / (1 + u[w])) - log(2 * u[l] / (1 + u[l]))
+                #       = log(u[w]) - log(u[l]) - (log(1 + u[w]) - log(1 + u[l]))
+                # where u[w] and u[l] are the policy/reference probability ratios
+                # for the chosen and rejected samples, respectively.
+                logits -= F.softplus(chosen_logratios) - F.softplus(rejected_logratios)
 
         # The beta is a temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5.
         # We ignore the reference model as beta -> 0. The label_smoothing parameter encodes our uncertainty about the labels and
@@ -1024,21 +1058,6 @@ class DPOTrainer(Trainer):
         elif self.loss_type == "ipo":
             # eqn (17) of the paper where beta is the regularization parameter for the IPO loss, denoted by tau in the paper.
             losses = (logits - 1 / (2 * self.beta)) ** 2
-        elif self.loss_type == "kto_pair":
-            # eqn (7) of the HALOs paper
-            chosen_KL = (policy_chosen_logps - reference_chosen_logps).mean().clamp(min=0)
-            rejected_KL = (policy_rejected_logps - reference_rejected_logps).mean().clamp(min=0)
-
-            chosen_logratios = policy_chosen_logps - reference_chosen_logps
-            rejected_logratios = policy_rejected_logps - reference_rejected_logps
-            # As described in the KTO report, the KL term for chosen (rejected) is estimated using the rejected (chosen) half.
-            losses = torch.cat(
-                (
-                    1 - F.sigmoid(self.beta * (chosen_logratios - rejected_KL)),
-                    1 - F.sigmoid(self.beta * (chosen_KL - rejected_logratios)),
-                ),
-                0,
-            )
         elif self.loss_type == "bco_pair":
             chosen_logratios = policy_chosen_logps - reference_chosen_logps
             rejected_logratios = policy_rejected_logps - reference_rejected_logps
@@ -1066,9 +1085,37 @@ class DPOTrainer(Trainer):
                 - 0.5 * F.logsigmoid(-chosen_rewards)
                 - 0.5 * F.logsigmoid(-rejected_rewards)
             )
+        elif self.loss_type == "aot_pair":
+            chosen_logratios = policy_chosen_logps - reference_chosen_logps
+            rejected_logratios = policy_rejected_logps - reference_rejected_logps
+
+            chosen_logratios_sorted, _ = torch.sort(chosen_logratios, dim=0)
+            rejected_logratios_sorted, _ = torch.sort(rejected_logratios, dim=0)
+
+            delta = chosen_logratios_sorted - rejected_logratios_sorted
+
+            losses = (
+                -F.logsigmoid(self.beta * delta) * (1 - self.label_smoothing)
+                - F.logsigmoid(-self.beta * delta) * self.label_smoothing
+            )
+
+        elif self.loss_type == "aot":
+            pi_logratios = policy_chosen_logps - policy_rejected_logps
+            ref_logratios = reference_chosen_logps - reference_rejected_logps
+
+            pi_logratios_sorted, _ = torch.sort(pi_logratios, dim=0)
+            ref_logratios_sorted, _ = torch.sort(ref_logratios, dim=0)
+
+            delta = pi_logratios_sorted - ref_logratios_sorted
+
+            losses = (
+                -F.logsigmoid(self.beta * delta) * (1 - self.label_smoothing)
+                - F.logsigmoid(-self.beta * delta) * self.label_smoothing
+            )
+
         else:
             raise ValueError(
-                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'kto_pair', 'bco_pair', 'sppo_hard', 'nca_pair', 'robust']"
+                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'bco_pair', 'sppo_hard', 'nca_pair', 'robust']"
             )
 
         chosen_rewards = (
